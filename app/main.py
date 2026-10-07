@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="素材发行授权核验 API",
-    version="1.7.0",
+    version="1.8.0",
     description=(
         "登记素材与授权（地区/渠道/带时区左闭右开时段/可发行次数），"
         "对发行申请做整体核验、原子占用，支持查询、一次性撤销、"
@@ -30,8 +30,10 @@ app = FastAPI(
         "候补可设 1～1440 分钟申请有效期，到期处理队首时标记 expired 并释放位置）；"
         "支持按地区+渠道临时冻结/恢复新额度发放（冻结期间拒绝新的直接"
         "发行、额度预留与候补受理；恢复时先按原受理顺序处理仍有效候补）；"
-        "并支持同一素材/地区/渠道下两条授权间的未占用次数转拨"
-        "（操作号幂等，转拨后同事务重算候补）。"
+        "支持同一素材/地区/渠道下两条授权间的未占用次数转拨"
+        "（操作号幂等，转拨后同事务重算候补）；"
+        "并提供按授权编号追溯的不可改写额度账本（期初余额 + 逐笔流水，"
+        "游标键集翻页，首次查询固定上界，相邻页余额连续）。"
     ),
     lifespan=lifespan,
 )
@@ -141,6 +143,26 @@ def transfer_authorization_quota(
     body: schemas.QuotaTransferCreate, db: Session = Depends(get_db)
 ):
     return services.transfer_quota(db, body)
+
+
+@app.get(
+    "/api/v1/authorizations/{authorization_id}/ledger",
+    response_model=schemas.AuthorizationLedgerOut,
+    tags=["authorizations"],
+    summary=(
+        "按授权编号追溯额度账本：期初余额 + 不可改写逐笔流水（游标键集"
+        "翻页；首次查询固定上界，后续写入不混入该次翻页，相邻页余额连续）"
+    ),
+)
+def get_authorization_ledger(
+    authorization_id: int,
+    cursor: str | None = None,
+    page_size: int = services.LEDGER_DEFAULT_PAGE_SIZE,
+    db: Session = Depends(get_db),
+):
+    return services.get_authorization_ledger_page(
+        db, authorization_id, cursor=cursor, page_size=page_size
+    )
 
 
 # ------------------------------------------------------------------ 发行

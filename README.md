@@ -83,6 +83,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `PATCH` | `/authorizations/{id}` | 启用/停用授权（仅影响新申请与新预留；与本通道发行类写事务共用通道咨询锁串行） |
 | `POST` | `/authorizations/migrate` | **授权退役：原授权未撤销申请一次性改挂到替代授权** |
 | `POST` | `/authorizations/transfer` | **授权间额度转拨：同一素材/地区/渠道下源授权未占用次数转拨到目标授权（操作号幂等）** |
+| `GET` | `/authorizations/{id}/ledger` | **按授权编号追溯额度账本：期初余额 + 不可改写逐笔流水（`?cursor=&page_size=` 游标翻页，首次查询固定上界，相邻页余额连续）** |
 | `POST` | `/distributions` | **提交发行申请：整体核验并原子占用** |
 | `GET` | `/distributions/{id}` | 查询发行申请（含各项命中授权） |
 | `POST` | `/distributions/{id}/revoke` | **撤销申请（仅可一次），释放占用次数** |
@@ -394,6 +395,46 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 `region`/`channel` → 422 请求体校验错误。冻结仅作用于指定的
 `region`+`channel`，其他通道的发行、预留、候补照常受理与成交。
 
+### 额度账本规则（按授权编号追溯）
+
+运营可按**授权编号**追溯每条授权的三项计数（已用 `used_count` /
+预留 `reserved_count` / 总额度 `max_count`）的完整变化过程：
+`GET /api/v1/authorizations/{id}/ledger?cursor=&page_size=`。
+
+1. **期初余额**：功能启用（本次版本建表）时**已存在**的授权，以启用
+   瞬间的三项计数回填为期初；**新授权**以创建时的计数（`0/0/max_count`）
+   为期初，随授权登记同事务落库。
+2. **逐笔流水**：以下业务造成的三项计数变化，均按**发生顺序**记为
+   **不可改写**的逐笔流水（仅追加；数据库触发器禁止 UPDATE/DELETE）：
+   - 直接发行（`direct_distribution`）与候补成交（`waitlist_fulfillment`）：used +1
+   - 额度预留（`reservation_placed`：reserved +1）及其
+     确认（`reservation_confirmed`：reserved −1、used +1）、
+     取消（`reservation_cancelled`：reserved −1）、
+     到期（`reservation_expired`：reserved −1）
+   - 申请撤销（`distribution_revoked`：used −1）、
+     申请改期（迁出端 `reschedule_out` / 迁入端 `reschedule_in`：used 搬移）
+   - 授权改挂（`migration_out` / `migration_in`：used 搬移）、
+     额度转拨（`transfer_out` / `transfer_in`：max_count 调整）
+   每笔含**关联业务编号**（`ref_type`+`ref_id`：申请 / 候补 / 预留 /
+   改挂记录 / 转拨记录）、三项计数的**变化前值与变化后值**及
+   **发生时刻**；搬移类业务还记录对端授权编号。
+3. **同成同败**：流水在原业务事务内追加，与计数更新、业务记录同一事务
+   提交或回滚；**被拒绝的请求、回滚、幂等重放（重复确认/同号转拨重放/
+   同瞬间改期等）均不留流水**，候补入队（不占额）也不留流水。
+4. **游标翻页**：每个授权内部流水序号 `entry_seq` 从 1 严格递增；
+   - 首次查询（不带 `cursor`）固定本次可见**上界**（查询瞬间最大 seq），
+     之后的新写入**不会混入该次翻页**；
+   - 用上一页响应的 `next_cursor` 取下一页（键集翻页，`next_cursor=null`
+     表示该次翻页已到末页）；重新从首页查询会得到新的上界；
+   - 每页返回**期初余额**、本页逐笔流水与**页末余额**（本页最后一笔的
+     变化后值；空页=期初），**相邻页余额连续**（上一页页末 == 下一页
+     首笔变化前值）。
+5. **错误**：未知授权（无期初行）→ 404 `not_found`；游标不可解析、
+   版本不符或不属于该授权 → 422 `invalid_ledger_cursor`；
+   `page_size` 不在 1～100 → 422 `invalid_page_size`（默认 20）。
+6. 账本查询为**只读**，不触发到期/候补惰性结算，原有业务接口的响应与
+   行为保持兼容（仅新增本查询接口与服务端内部记账）。
+
 ### 错误响应格式
 
 所有业务错误统一为：
@@ -442,6 +483,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 422 | `channel_frozen` | 通道冻结期间提交新的直接发行 / 额度预留 / 候补受理 / 额度转拨；明确拒绝、不占额、不入队，`details` 携带冻结原因 |
 | 422 | `quota_transfer_rejected` | 额度转拨核验未通过；`details` 列明原因（见下），两端额度均不变 |
 | 409 | `quota_transfer_conflict` | 相同操作号携带不同参数（源/目标/次数任一不同）的转拨请求 |
+| 422 | `invalid_ledger_cursor` | 额度账本游标不可解析、版本不符或不属于该授权编号 |
+| 422 | `invalid_page_size` | 额度账本 `page_size` 不在 1～100（默认 20） |
 | 404 | `not_found` | 路径中的素材/授权/申请/预留/候补编号不存在（改挂时原/替代授权任一不存在；转拨时源/目标授权任一不存在） |
 
 `distribution_rejected` / `reschedule_rejected` / `reservation_rejected`
@@ -981,6 +1024,73 @@ curl -s -X POST http://localhost:8000/api/v1/authorizations/transfer \
 }
 ```
 
+### 额度账本操作示例（curl）
+
+```bash
+# 首次查询授权 1 的账本（page_size 1～100，默认 20）
+curl -s "http://localhost:8000/api/v1/authorizations/1/ledger?page_size=2"
+```
+
+```json
+{
+  "authorization_id": 1,
+  "opening_balance": {"used_count": 0, "reserved_count": 0, "max_count": 5},
+  "entries": [
+    {
+      "entry_seq": 1,
+      "event_type": "direct_distribution",
+      "ref_type": "distribution", "ref_id": "1",
+      "counterparty_authorization_id": null,
+      "before_used_count": 0, "before_reserved_count": 0, "before_max_count": 5,
+      "after_used_count": 1, "after_reserved_count": 0, "after_max_count": 5,
+      "occurred_at": "2026-10-07T02:40:04.804Z",
+      "detail": {"distribution_id": 1, "item_index": 0}
+    },
+    {
+      "entry_seq": 2,
+      "event_type": "reservation_placed",
+      "ref_type": "reservation", "ref_id": "1",
+      "counterparty_authorization_id": null,
+      "before_used_count": 1, "before_reserved_count": 0, "before_max_count": 5,
+      "after_used_count": 1, "after_reserved_count": 1, "after_max_count": 5,
+      "occurred_at": "2026-10-07T02:41:10.112Z",
+      "detail": {"reservation_id": 1, "item_index": 0}
+    }
+  ],
+  "page_end_balance": {"used_count": 1, "reserved_count": 1, "max_count": 5},
+  "next_cursor": "WyJxMSIsMSwyLDhd",
+  "page_size": 2
+}
+```
+
+```bash
+# 用上一页 next_cursor 翻下一页（固定上界：本次翻页不会看到首页之后的新写入）
+curl -s "http://localhost:8000/api/v1/authorizations/1/ledger?page_size=2&cursor=WyJxMSIsMSwyLDhd"
+# next_cursor 为 null 即该次翻页到末页；需要看新写入则不带 cursor 重新从首页开始。
+
+# 未知授权 -> 404 not_found
+curl -i "http://localhost:8000/api/v1/authorizations/9999/ledger"
+# 游标损坏 / 属于别的授权 -> 422 invalid_ledger_cursor
+curl -i "http://localhost:8000/api/v1/authorizations/1/ledger?cursor=garbage"
+# 页大小越界 -> 422 invalid_page_size
+curl -i "http://localhost:8000/api/v1/authorizations/1/ledger?page_size=0"
+```
+
+事件类型（`event_type`）与关联业务编号（`ref_type`/`ref_id`）：
+
+| event_type | 计数变化 | ref_type | ref_id 含义 |
+| --- | --- | --- | --- |
+| `direct_distribution` | used +1 | `distribution` | 直接发行申请编号 |
+| `waitlist_fulfillment` | used +1 | `waitlist` | 候补编号（`detail` 另含成交申请编号） |
+| `reservation_placed` | reserved +1 | `reservation` | 预留编号 |
+| `reservation_confirmed` | reserved −1、used +1 | `reservation` | 预留编号（`detail` 另含确认申请编号） |
+| `reservation_cancelled` | reserved −1 | `reservation` | 预留编号 |
+| `reservation_expired` | reserved −1 | `reservation` | 预留编号 |
+| `distribution_revoked` | used −1 | `distribution` | 被撤销申请编号 |
+| `reschedule_out` / `reschedule_in` | used 搬移 | `distribution` | 改期申请编号（对端授权见 `counterparty_authorization_id`） |
+| `migration_out` / `migration_in` | used 搬移 | `authorization_migration` | 改挂记录编号（两端共用同一编号） |
+| `transfer_out` / `transfer_in` | max_count 调整 | `quota_transfer` | 转拨记录编号（`detail` 另含操作号 `operation_no`） |
+
 ---
 
 ## 5. 并发控制设计
@@ -1055,6 +1165,12 @@ curl -s -X POST http://localhost:8000/api/v1/authorizations/transfer \
    快照（重放不受随后的冻结/停用影响），同号异参 409；并发同号在
    通道锁内串行化，跨通道同号由唯一约束兜底（失败方回滚后按既有
    记录重放/判冲突），绝不重复转拨。
+7. **额度账本同事务记账**：三项计数的每次条件推进以
+   `UPDATE ... RETURNING` 取回变化后精确值，与逐笔流水（变化前/后值、
+   关联业务编号、发生时刻）在**原业务事务**内一并提交或回滚；同授权
+   的流水序号在通道咨询锁 + 授权行锁内按受理顺序连续分配。流水表
+   仅允许追加，数据库触发器禁止任何 UPDATE/DELETE；拒绝、回滚、
+   幂等重放路径在计数更新之前退出，因而不留流水。
 
 核验/预留/改期/改挂不通过即 `ROLLBACK`，不产生任何次数或归属变化。任意时刻
 都有不变量：
@@ -1109,7 +1225,7 @@ curl -s -X POST http://localhost:8000/api/v1/authorizations/transfer \
   原因）并释放位置、其后有效候补按序成交、有效期内正常成交、查询惰性
   失效与列表派生 expired、取消过期 409、过期不占额不阻塞新申请、
   多笔过期一次性清理**，以及账实相符。
-- `tests/test_channel_freeze.py`：111 项通道额度冻结/恢复端到端与并发
+- `tests/test_channel_freeze.py`：119 项通道额度冻结/恢复端到端与并发
   用例，覆盖冻结/恢复/查询生命周期与幂等（重复同态不改原因/变更时刻、
   冻结→恢复→再冻结更新）、无授权通道/缺原因/非法 action 报错、冻结期
   新直接发行/新预留/候补受理全部拒绝且不占额不入队、冻结期既有预留
@@ -1125,6 +1241,15 @@ curl -s -X POST http://localhost:8000/api/v1/authorizations/transfer \
   候补（新增余量供队首、过期/失配出队）、幂等重放返回首次结果、
   异参 409、重放不受随后冻结/停用影响、并发不超额、并发同号同参
   不重复转拨、并发同号异参恰一笔生效，以及全量账实相符。
+- `tests/test_ledger.py`：72 项额度账本端到端用例，覆盖新授权期初
+  （0/0/max）、直接发行/撤销/预留占额/确认/取消/到期/改期/改挂/
+  转拨/候补成交逐笔流水的变化前后值与关联业务编号、拒绝与幂等重放
+  不留流水、入队不占额不留痕、转拨两端流水与同号重放不留痕、
+  翻页 seq 连续与相邻页余额连续、首次查询固定上界（后续写入不混入）、
+  页末余额=授权当前计数、未知授权 404、游标损坏/串授权/版本不符 422、
+  page_size 越界 422、并发混合写后逐笔滚算与账实相符、流水表
+  UPDATE/DELETE 触发器拦截，以及旧库升级回填期初（启用瞬间计数）的
+  幂等迁移。
 
 ```bash
 pip install -r requirements.txt httpx
@@ -1139,6 +1264,7 @@ python3 -m tests.test_reservations
 python3 -m tests.test_waitlist
 python3 -m tests.test_channel_freeze
 python3 -m tests.test_transfer
+python3 -m tests.test_ledger
 ```
 
 > 测试会先 `DROP` 再重建全部表，请勿指向含生产数据的数据库。
@@ -1155,15 +1281,20 @@ python3 -m tests.test_transfer
 ├── app/
 │   ├── main.py        # FastAPI 路由与异常处理
 │   ├── config.py      # 环境变量配置（含预留 TTL 1～30 范围）
-│   ├── database.py    # 引擎/会话/启动建表（旧库幂等补齐 reserved_count 与候补表）
+│   ├── database.py    # 引擎/会话/启动建表（旧库幂等补齐 reserved_count、
+│   │                  # 候补表、账本表/期初回填/流水不可改写触发器）
 │   ├── models.py      # Material / Authorization / Distribution(+Item) /
-│   │                  # Reservation(+Item) / Waitlist(+Item) / ChannelFreeze / QuotaTransfer
-│   ├── schemas.py     # 请求响应模型与时段/时区/TTL/冻结原因/转拨参数校验
-│   ├── errors.py      # 业务错误码（预留四态、候补状态、通道冻结 channel_frozen/channel_not_found、
-│   │                  # 转拨 quota_transfer_rejected/quota_transfer_conflict）
+│   │                  # Reservation(+Item) / Waitlist(+Item) / ChannelFreeze /
+│   │                  # QuotaTransfer / AuthorizationMigration /
+│   │                  # QuotaLedgerOpening / QuotaLedgerEntry
+│   ├── schemas.py     # 请求响应模型与时段/时区/TTL/冻结原因/转拨/账本校验
+│   ├── errors.py      # 业务错误码（预留四态、候补状态、通道冻结、转拨、
+│   │                  # 账本 invalid_ledger_cursor/invalid_page_size）
+│   ├── ledger.py      # 额度账本：期初/条件计数推进 RETURNING/逐笔流水追加/
+│   │                  # 不透明游标编码校验/固定上界键集翻页
 │   └── services.py    # 核验占用 / 预留 / 确认 / 取消 / 到期结算 /
 │                      # 撤销 / 改期 / 改挂 / 候补受理与队列成交 /
-│                      # 通道冻结恢复 / 授权间额度转拨（核心事务逻辑）
+│                      # 通道冻结恢复 / 授权间额度转拨 / 账本查询（核心事务逻辑）
 └── tests/
     ├── test_api.py
     ├── test_migrate.py
@@ -1173,5 +1304,6 @@ python3 -m tests.test_transfer
     ├── test_waitlist.py
     ├── test_channel_freeze.py
     ├── test_transfer.py
+    ├── test_ledger.py
     └── test_concurrency.py
 ```

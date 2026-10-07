@@ -6,13 +6,16 @@
 from datetime import datetime, timezone
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     ForeignKey,
     Index,
     Integer,
     String,
     DateTime,
+    UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
@@ -480,6 +483,135 @@ class QuotaTransfer(Base):
     target_reserved_count: Mapped[int] = mapped_column(
         Integer, nullable=False
     )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class QuotaLedgerOpening(Base):
+    """授权额度账本的**期初余额**（每个授权至多一行，不可变）。
+
+    - 功能启用（建表）时**已存在**的授权：以启用瞬间该授权的
+      ``used_count`` / ``reserved_count`` / ``max_count`` 现状回填；
+    - 功能启用后**新登记**的授权：以创建时的计数（``0/0/max_count``）
+      为期初，随授权创建同事务落库。
+
+    期初行一经写入不再修改；流水从期初之后开始追加，逐笔滚出页末余额。
+    """
+
+    __tablename__ = "quota_ledger_openings"
+    __table_args__ = (
+        Index("ux_quota_ledger_opening_auth", "authorization_id", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    authorization_id: Mapped[int] = mapped_column(
+        ForeignKey("authorizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    used_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    reserved_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class AuthorizationMigration(Base):
+    """一次授权退役改挂的业务记录：为额度流水提供**关联业务编号**。
+
+    改挂成功（原授权停用、明细与次数原子搬移、同事务候补重算完成）
+    才在同一事务内落一行；被拒绝/回滚的改挂不留记录。外部业务响应
+    （``AuthorizationMigrationOut``）字段与状态码保持兼容，仅新增
+    内部编号供运营按账追溯。
+    """
+
+    __tablename__ = "authorization_migrations"
+    __table_args__ = (
+        Index("ix_auth_migration_pair", "source_authorization_id", "id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_authorization_id: Mapped[int] = mapped_column(
+        ForeignKey("authorizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    replacement_authorization_id: Mapped[int] = mapped_column(
+        ForeignKey("authorizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    migrated_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
+class QuotaLedgerEntry(Base):
+    """授权额度账本的**逐笔流水**：只追加、不可改写（数据库触发器禁止
+    UPDATE/DELETE；应用层也只 INSERT）。
+
+    每个授权内部以 ``entry_seq`` 从 1 开始严格递增（同通道咨询锁串行，
+    ``MAX(entry_seq)+1`` 无竞争），按 ``(entry_seq)`` 键集翻页；
+    ``occurred_at`` 为该笔变化随业务事务提交时的发生时刻（同一惰性
+    结算/同一成交轮次共用一个时刻）。每笔记录三项计数
+    （``used_count`` / ``reserved_count`` / ``max_count``）变化前与
+    变化后的完整快照，任一项变化即为一笔；拒绝、回滚、幂等重放不产生
+    流水。
+
+    ``ref_type`` + ``ref_id`` 为关联业务编号（direct_distribution /
+    waitlist_fulfillment / reservation_* / revoke / reschedule /
+    migrate / transfer）；``counterparty_authorization_id`` 记录搬移类
+    业务（改期/改挂/转拨）的对端授权，便于双向核对。
+    """
+
+    __tablename__ = "quota_ledger_entries"
+    __table_args__ = (
+        UniqueConstraint(
+            "authorization_id",
+            "entry_seq",
+            name="ux_quota_ledger_auth_seq",
+        ),
+        Index(
+            "ix_quota_ledger_auth_seq",
+            "authorization_id",
+            "entry_seq",
+        ),
+        CheckConstraint("entry_seq >= 1", name="ck_ledger_seq_positive"),
+        CheckConstraint(
+            "before_used_count >= 0 AND before_reserved_count >= 0",
+            name="ck_ledger_before_nonneg",
+        ),
+        CheckConstraint(
+            "after_used_count >= 0 AND after_reserved_count >= 0",
+            name="ck_ledger_after_nonneg",
+        ),
+        # 至少一项计数发生变化才允许落流水（拒绝/空操作不留痕）。
+        CheckConstraint(
+            "before_used_count <> after_used_count "
+            "OR before_reserved_count <> after_reserved_count "
+            "OR before_max_count <> after_max_count",
+            name="ck_ledger_changed",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    authorization_id: Mapped[int] = mapped_column(
+        ForeignKey("authorizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    entry_seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    ref_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    ref_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    counterparty_authorization_id: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    before_used_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    before_reserved_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    before_max_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    after_used_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    after_reserved_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    after_max_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    detail: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, nullable=False
     )

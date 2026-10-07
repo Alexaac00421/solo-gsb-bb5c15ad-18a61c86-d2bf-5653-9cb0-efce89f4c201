@@ -467,3 +467,66 @@ class QuotaTransferOut(BaseModel):
         description="目标授权（转入方）转拨后的额度与占用快照"
     )
     created_at: datetime = Field(description="首次转拨完成时刻（带时区）")
+
+
+# ------------------------------------------------------------- 额度账本
+class QuotaLedgerBalance(BaseModel):
+    """三项计数余额快照：已用 / 预留 / 总额度。"""
+
+    used_count: int
+    reserved_count: int
+    max_count: int
+
+
+class QuotaLedgerEntryOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    entry_seq: int = Field(description="授权内严格递增的流水序号（从 1 起）")
+    event_type: str = Field(
+        description=(
+            "事件类型：direct_distribution / waitlist_fulfillment / "
+            "reservation_placed / reservation_confirmed / "
+            "reservation_cancelled / reservation_expired / "
+            "distribution_revoked / reschedule_in / reschedule_out / "
+            "migration_in / migration_out / transfer_in / transfer_out"
+        )
+    )
+    ref_type: str = Field(
+        description="关联业务编号类型：distribution / waitlist / "
+        "reservation / authorization_migration / quota_transfer"
+    )
+    ref_id: str = Field(description="关联业务编号（字符串形式）")
+    counterparty_authorization_id: int | None = Field(
+        default=None,
+        description="搬移类业务（改期/改挂/转拨）的对端授权编号",
+    )
+    before_used_count: int
+    before_reserved_count: int
+    before_max_count: int
+    after_used_count: int
+    after_reserved_count: int
+    after_max_count: int
+    occurred_at: datetime = Field(description="变化随业务事务发生的时刻（带时区）")
+    detail: dict | None = Field(
+        default=None, description="业务附加上下文（如 item_index、operation_no）"
+    )
+
+
+class AuthorizationLedgerOut(BaseModel):
+    authorization_id: int
+    opening_balance: QuotaLedgerBalance = Field(
+        description="期初余额：功能启用时已有授权以启用瞬间计数为期初；"
+        "新授权以创建时计数（0/0/max_count）为期初"
+    )
+    entries: list[QuotaLedgerEntryOut] = Field(
+        description="本页逐笔流水（按发生顺序 entry_seq 升序）"
+    )
+    page_end_balance: QuotaLedgerBalance = Field(
+        description="页末余额：本页最后一笔变化后值（无流水页=期初）；"
+        "相邻页余额连续"
+    )
+    next_cursor: str | None = Field(
+        default=None,
+        description="下一游标；null 表示该次翻页（首次查询固定上界内）已到末页",
+    )
+    page_size: int

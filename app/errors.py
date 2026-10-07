@@ -325,3 +325,26 @@ class TransferOperationConflict(APIError):
                 "相同操作号必须以相同参数重放"
             ),
         )
+
+
+# ---------------------------------------------------------------- 额度账本
+class InvalidLedgerCursor(APIError):
+    """额度账本翻页游标不可解析、版本不符或不属于该授权（422）。"""
+
+    def __init__(self, message: str):
+        super().__init__(
+            status_code=422,
+            code="invalid_ledger_cursor",
+            message=message,
+        )
+
+
+class InvalidLedgerPageSize(APIError):
+    """额度账本页大小不在允许范围（422）。"""
+
+    def __init__(self, value: int, maximum: int):
+        super().__init__(
+            status_code=422,
+            code="invalid_page_size",
+            message=f"页大小须为 1～{maximum} 的正整数，收到 {value}",
+        )

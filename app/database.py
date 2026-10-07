@@ -154,6 +154,50 @@ def _upgrade_existing_tables(bind) -> None:
                     )
                 )
 
+        # 额度账本功能（新表由 create_all 直接建出；旧库同样由 create_all
+        # 补建缺失表）。两步升级：
+        # 1) 为功能启用时已存在的授权回填**期初余额**（以启用瞬间的
+        #    used/reserved/max 现状为期初；ON CONFLICT 幂等，重复升级不
+        #    覆盖，期初一旦写入不可变）。须在 reserved_count 列补齐之后执行。
+        conn.execute(
+            text(
+                "INSERT INTO quota_ledger_openings "
+                "(authorization_id, used_count, reserved_count, "
+                "max_count, created_at) "
+                "SELECT a.id, a.used_count, a.reserved_count, a.max_count, "
+                "now() FROM authorizations a "
+                "WHERE NOT EXISTS (SELECT 1 FROM quota_ledger_openings o "
+                "WHERE o.authorization_id = a.id)"
+            )
+        )
+        # 2) 流水表禁止 UPDATE / DELETE（TRUNCATE 受属主权限另行管控）：
+        #    应用层只追加，数据库层兜底「不可改写」。触发器函数幂等创建。
+        conn.execute(
+            text(
+                "CREATE OR REPLACE FUNCTION quota_ledger_entries_immutable() "
+                "RETURNS trigger LANGUAGE plpgsql AS $$ "
+                "BEGIN "
+                "  RAISE EXCEPTION 'quota_ledger_entries 为不可改写流水，"
+                "禁止 %（只允许追加）', TG_OP; "
+                "END; $$"
+            )
+        )
+        has_trg = conn.execute(
+            text(
+                "SELECT 1 FROM pg_trigger WHERE tgname="
+                "'trg_quota_ledger_immutable'"
+            )
+        ).first()
+        if not has_trg:
+            conn.execute(
+                text(
+                    "CREATE TRIGGER trg_quota_ledger_immutable "
+                    "BEFORE UPDATE OR DELETE ON quota_ledger_entries "
+                    "FOR EACH ROW EXECUTE FUNCTION "
+                    "quota_ledger_entries_immutable()"
+                )
+            )
+
 
 def get_db():
     """FastAPI 依赖：每请求一个事务会话。"""

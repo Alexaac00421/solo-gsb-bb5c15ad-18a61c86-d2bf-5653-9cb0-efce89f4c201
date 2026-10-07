@@ -69,7 +69,7 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from app import models
+from app import ledger, models
 from app.errors import (
     AlreadyRevoked,
     ChannelFrozen,
@@ -77,6 +77,7 @@ from app.errors import (
     DistributionRejected,
     DistributionRevoked,
     DuplicateMaterialItems,
+    InvalidLedgerPageSize,
     InvalidReservationStatus,
     InvalidWaitlistStatus,
     MigrationRejected,
@@ -148,6 +149,16 @@ def create_authorization(
         max_count=data.max_count,
     )
     db.add(auth)
+    db.flush()
+    # 新授权以创建时的计数（0/0/max_count）为额度账本期初，与授权
+    # 同事务落库（同成同败）。
+    ledger.ensure_opening(
+        db,
+        auth.id,
+        used_count=0,
+        reserved_count=0,
+        max_count=data.max_count,
+    )
     db.commit()
     db.refresh(auth)
     return auth
@@ -420,6 +431,9 @@ def _settle_expired(
         )
     expiring = list(db.scalars(resv_stmt))
 
+    # 先一次性载入全部到期预留的明细（按预留 id、明细 id 排序），既用于
+    # 合并行锁集合，也作为逐笔归还与逐笔流水的稳定发生顺序。
+    expiry_items: list[tuple[models.Reservation, models.ReservationItem]] = []
     auth_counts: Counter[int] = Counter()
     for resv in expiring:
         items = list(
@@ -431,28 +445,44 @@ def _settle_expired(
                 .order_by(models.ReservationItem.id.asc())
             )
         )
-        auth_counts.update(item.authorization_id for item in items)
+        for item in items:
+            auth_counts.update([item.authorization_id])
+            expiry_items.append((resv, item))
 
     lock_ids = sorted(set(auth_counts) | set(extra_auth_ids or []))
     locked = _lock_authorizations(db, lock_ids)
 
-    # 条件归还：每个授权按到期预留条数一次性扣减 reserved_count。
-    for auth_id, n in auth_counts.items():
-        result = db.execute(
-            update(models.Authorization)
-            .where(
-                models.Authorization.id == auth_id,
-                models.Authorization.reserved_count >= n,
-            )
-            .values(
-                reserved_count=models.Authorization.reserved_count - n
-            )
+    # 逐预留、逐项条件归还 reserved_count 并记一笔「预留到期」流水
+    # （同一预留内同一授权至多出现一次：素材已去重）。逐项 guard
+    # reserved_count >= 1 与原有按授权聚合的 >= n 护栏等价。
+    for resv, item in expiry_items:
+        changed = ledger.bump_counters(
+            db,
+            item.authorization_id,
+            reserved_delta=-1,
+            guard_sql="reserved_count >= 1",
         )
-        if result.rowcount != 1:
+        if changed is None:
             db.rollback()
             raise RuntimeError(
-                f"到期释放失败：授权 {auth_id} reserved_count 不足 {n}"
+                "到期释放失败：授权 "
+                f"{item.authorization_id} reserved_count 不足"
             )
+        before, after = changed
+        ledger.record_quota_change(
+            db,
+            authorization_id=item.authorization_id,
+            event_type=ledger.EVENT_RESERVATION_EXPIRED,
+            ref_type="reservation",
+            ref_id=resv.id,
+            occurred_at=now,
+            before=before,
+            after=after,
+            detail={
+                "reservation_id": resv.id,
+                "item_index": item.item_index,
+            },
+        )
 
     if expiring:
         db.execute(
@@ -700,23 +730,6 @@ def _process_waitlist(
             return fulfilled
 
         # 整体可承接：条件占额（护栏断言），生成一笔 approved 申请。
-        for auth in chosen.values():
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth.id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(used_count=models.Authorization.used_count + 1)
-            )
-            if result.rowcount != 1:
-                db.rollback()
-                raise RuntimeError(
-                    f"候补成交失败：授权 {auth.id} 余量不足"
-                )
-
         distribution = models.Distribution(
             region=region,
             channel=channel,
@@ -734,9 +747,45 @@ def _process_waitlist(
                     item_index=index,
                 )
             )
+
+        # 占额在申请/明细落库之后进行，使「候补成交」流水能关联到
+        # 本笔成交实际生成的申请编号。
+        fulfill_now = utcnow()
+        for index, mid in enumerate(material_ids):
+            auth = chosen[mid]
+            changed = ledger.bump_counters(
+                db,
+                auth.id,
+                used_delta=1,
+                guard_sql=(
+                    "used_count + reserved_count < max_count"
+                ),
+            )
+            if changed is None:
+                db.rollback()
+                raise RuntimeError(
+                    f"候补成交失败：授权 {auth.id} 余量不足"
+                )
+            before, after = changed
+            ledger.record_quota_change(
+                db,
+                authorization_id=auth.id,
+                event_type=ledger.EVENT_WAITLIST_FULFILLMENT,
+                ref_type="waitlist",
+                ref_id=head.id,
+                occurred_at=fulfill_now,
+                before=before,
+                after=after,
+                detail={
+                    "waitlist_id": head.id,
+                    "distribution_id": distribution.id,
+                    "item_index": index,
+                },
+            )
+
         head.status = "fulfilled"
         head.distribution_id = distribution.id
-        head.fulfilled_at = utcnow()
+        head.fulfilled_at = fulfill_now
         db.flush()
         fulfilled += 1
 
@@ -795,34 +844,8 @@ def create_distribution(
             db.rollback()
             raise DistributionRejected(reasons)
 
-        # 5) 条件占用正式次数（含预留占用护栏），断言影响行数。
-        for auth in chosen.values():
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth.id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(used_count=models.Authorization.used_count + 1)
-            )
-            if result.rowcount != 1:
-                db.rollback()
-                raise DistributionRejected(
-                    [
-                        {
-                            "material_id": auth.material_id,
-                            "reason": "quota_exhausted",
-                            "message": (
-                                f"授权 id={auth.id} 余量不足，"
-                                "并发占用冲突，本次申请整体拒绝"
-                            ),
-                        }
-                    ]
-                )
-
-        # 6) 落库申请及逐项占用记录。
+        # 5) 先落库申请及逐项占用记录，再条件占用正式次数——使流水的
+        #    关联业务编号即本申请编号。
         distribution = models.Distribution(
             region=data.region,
             channel=data.channel,
@@ -839,6 +862,45 @@ def create_distribution(
                     authorization_id=chosen[mid].id,
                     item_index=index,
                 )
+            )
+
+        change_now = utcnow()
+        for index, mid in enumerate(material_ids):
+            auth = chosen[mid]
+            changed = ledger.bump_counters(
+                db,
+                auth.id,
+                used_delta=1,
+                guard_sql="used_count + reserved_count < max_count",
+            )
+            if changed is None:
+                db.rollback()
+                raise DistributionRejected(
+                    [
+                        {
+                            "material_id": auth.material_id,
+                            "reason": "quota_exhausted",
+                            "message": (
+                                f"授权 id={auth.id} 余量不足，"
+                                "并发占用冲突，本次申请整体拒绝"
+                            ),
+                        }
+                    ]
+                )
+            before, after = changed
+            ledger.record_quota_change(
+                db,
+                authorization_id=auth.id,
+                event_type=ledger.EVENT_DIRECT_DISTRIBUTION,
+                ref_type="distribution",
+                ref_id=distribution.id,
+                occurred_at=change_now,
+                before=before,
+                after=after,
+                detail={
+                    "distribution_id": distribution.id,
+                    "item_index": index,
+                },
             )
         db.commit()
     except (ChannelFrozen, DistributionRejected):
@@ -937,25 +999,38 @@ def revoke_distribution(
 
         # 同一授权在本申请中至多出现一次（素材已去重），逐项释放。
         # 条件 ``used_count >= 1`` 作为不重复释放/账实相符的最后防线。
-        for auth_id in auth_ids:
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth_id,
-                    models.Authorization.used_count >= 1,
-                )
-                .values(
-                    used_count=models.Authorization.used_count - 1
-                )
+        revoke_now = datetime.now(timezone.utc)
+        for item in items:
+            changed = ledger.bump_counters(
+                db,
+                item.authorization_id,
+                used_delta=-1,
+                guard_sql="used_count >= 1",
             )
-            if result.rowcount != 1:
+            if changed is None:
                 db.rollback()
                 raise RuntimeError(
-                    f"撤销释放失败：授权 {auth_id} used_count 异常"
+                    f"撤销释放失败：授权 {item.authorization_id} "
+                    "used_count 异常"
                 )
+            before, after = changed
+            ledger.record_quota_change(
+                db,
+                authorization_id=item.authorization_id,
+                event_type=ledger.EVENT_REVOKE,
+                ref_type="distribution",
+                ref_id=distribution_id,
+                occurred_at=revoke_now,
+                before=before,
+                after=after,
+                detail={
+                    "distribution_id": distribution_id,
+                    "item_index": item.item_index,
+                },
+            )
 
         distribution.status = "revoked"
-        distribution.revoked_at = datetime.now(timezone.utc)
+        distribution.revoked_at = revoke_now
         db.flush()
 
         # 撤销释放额度后，按受理顺序重算本通道候补队首；冻结期间仅结算
@@ -1071,40 +1146,71 @@ def reschedule_distribution(
         # 原子搬移：归属变化的项逐条「原授权条件 -1、新授权条件 +1」，
         # 归属不变的项不动次数。素材在申请内唯一 ⇒ 每个授权在一次改期中
         # 至多作为一端出现一次，不会既加又减。
+        move_now = utcnow()
         for item in items:
             new_auth = chosen[item.material_id]
             old_auth_id = item.authorization_id
             if new_auth.id == old_auth_id:
                 continue
-            dec = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == old_auth_id,
-                    models.Authorization.used_count >= 1,
-                )
-                .values(used_count=models.Authorization.used_count - 1)
+            moved_out = ledger.bump_counters(
+                db,
+                old_auth_id,
+                used_delta=-1,
+                guard_sql="used_count >= 1",
             )
-            if dec.rowcount != 1:
+            if moved_out is None:
                 db.rollback()
                 raise RuntimeError(
                     f"改期迁出失败：授权 {old_auth_id} used_count 异常"
                 )
-            inc = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == new_auth.id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(used_count=models.Authorization.used_count + 1)
+            before_out, after_out = moved_out
+            moved_in = ledger.bump_counters(
+                db,
+                new_auth.id,
+                used_delta=1,
+                guard_sql="used_count + reserved_count < max_count",
             )
-            if inc.rowcount != 1:
+            if moved_in is None:
                 db.rollback()
                 raise RuntimeError(
                     f"改期迁入失败：授权 {new_auth.id} 余量不足"
                 )
+            before_in, after_in = moved_in
             item.authorization_id = new_auth.id
+            ledger.record_quota_change(
+                db,
+                authorization_id=old_auth_id,
+                event_type=ledger.EVENT_RESCHEDULE_OUT,
+                ref_type="distribution",
+                ref_id=distribution_id,
+                occurred_at=move_now,
+                before=before_out,
+                after=after_out,
+                counterparty_authorization_id=new_auth.id,
+                detail={
+                    "distribution_id": distribution_id,
+                    "item_index": item.item_index,
+                    "old_occur_at": distribution.occur_at.isoformat(),
+                    "new_occur_at": data.occur_at.isoformat(),
+                },
+            )
+            ledger.record_quota_change(
+                db,
+                authorization_id=new_auth.id,
+                event_type=ledger.EVENT_RESCHEDULE_IN,
+                ref_type="distribution",
+                ref_id=distribution_id,
+                occurred_at=move_now,
+                before=before_in,
+                after=after_in,
+                counterparty_authorization_id=old_auth_id,
+                detail={
+                    "distribution_id": distribution_id,
+                    "item_index": item.item_index,
+                    "old_occur_at": distribution.occur_at.isoformat(),
+                    "new_occur_at": data.occur_at.isoformat(),
+                },
+            )
 
         distribution.occur_at = data.occur_at
         db.flush()
@@ -1179,21 +1285,16 @@ def create_reservation(db: Session, data: ReservationCreate) -> models.Reservati
 
         # 逐项条件预留：used + reserved < max 护栏，断言影响行数。
         # 素材已去重，同一授权在一次预留中至多被选中一次。
+        place_now = utcnow()
         for index, mid in enumerate(material_ids):
             auth = chosen[mid]
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth.id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(
-                    reserved_count=models.Authorization.reserved_count + 1
-                )
+            changed = ledger.bump_counters(
+                db,
+                auth.id,
+                reserved_delta=1,
+                guard_sql="used_count + reserved_count < max_count",
             )
-            if result.rowcount != 1:
+            if changed is None:
                 db.rollback()
                 raise ReservationRejected(
                     [
@@ -1208,6 +1309,7 @@ def create_reservation(db: Session, data: ReservationCreate) -> models.Reservati
                         }
                     ]
                 )
+            before, after = changed
             db.add(
                 models.ReservationItem(
                     reservation_id=reservation.id,
@@ -1215,6 +1317,17 @@ def create_reservation(db: Session, data: ReservationCreate) -> models.Reservati
                     authorization_id=auth.id,
                     item_index=index,
                 )
+            )
+            ledger.record_quota_change(
+                db,
+                authorization_id=auth.id,
+                event_type=ledger.EVENT_RESERVATION_PLACED,
+                ref_type="reservation",
+                ref_id=reservation.id,
+                occurred_at=place_now,
+                before=before,
+                after=after,
+                detail={"reservation_id": reservation.id, "item_index": index},
             )
         db.commit()
     except (ChannelFrozen, ReservationRejected):
@@ -1397,10 +1510,6 @@ def confirm_reservation(
             raise ReservationExpired(reservation_id)
 
         # pending：通道结算已保证 now < expires_at（否则已置 expired）。
-        now = utcnow()
-        auth_ids = sorted(
-            {item.authorization_id for item in resv.items}
-        )
 
         # 生成一笔 approved 申请及逐项明细，归属预留时命中的同一授权。
         distribution = models.Distribution(
@@ -1423,42 +1532,54 @@ def confirm_reservation(
 
         # 原子转账：reserved_count - 1（条件 >=1）紧接 used_count + 1
         # （条件 used + reserved < max，即槽位确实来自本预留），
-        # 占用总量不变，绝不超额、不重复。
-        for auth_id in auth_ids:
-            dec = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth_id,
-                    models.Authorization.reserved_count >= 1,
-                )
-                .values(
-                    reserved_count=models.Authorization.reserved_count - 1
-                )
+        # 占用总量不变，绝不超额、不重复。每个授权一笔流水：前后快照
+        # 分别为转账前与转账完成后（reserved-1、used+1 的合计变化）。
+        confirm_now = utcnow()
+        for item in sorted(resv.items, key=lambda it: it.authorization_id):
+            auth_id = item.authorization_id
+            moved_out = ledger.bump_counters(
+                db,
+                auth_id,
+                reserved_delta=-1,
+                guard_sql="reserved_count >= 1",
             )
-            if dec.rowcount != 1:
+            if moved_out is None:
                 db.rollback()
                 raise RuntimeError(
                     f"确认预留失败：授权 {auth_id} reserved_count 异常"
                 )
-            inc = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth_id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(used_count=models.Authorization.used_count + 1)
+            before, _mid = moved_out
+            moved_in = ledger.bump_counters(
+                db,
+                auth_id,
+                used_delta=1,
+                guard_sql="used_count + reserved_count < max_count",
             )
-            if inc.rowcount != 1:
+            if moved_in is None:
                 db.rollback()
                 raise RuntimeError(
                     f"确认预留失败：授权 {auth_id} 正式余量不足"
                 )
+            _before2, after = moved_in
+            ledger.record_quota_change(
+                db,
+                authorization_id=auth_id,
+                event_type=ledger.EVENT_RESERVATION_CONFIRMED,
+                ref_type="reservation",
+                ref_id=reservation_id,
+                occurred_at=confirm_now,
+                before=before,
+                after=after,
+                detail={
+                    "reservation_id": reservation_id,
+                    "distribution_id": distribution.id,
+                    "item_index": item.item_index,
+                },
+            )
 
         resv.status = "confirmed"
         resv.distribution_id = distribution.id
-        resv.confirmed_at = now
+        resv.confirmed_at = confirm_now
         db.commit()
     except (
         ResourceNotFound,
@@ -1525,28 +1646,38 @@ def cancel_reservation(db: Session, reservation_id: int) -> models.Reservation:
             db.rollback()
             raise ReservationExpired(reservation_id, action="取消")
 
-        auth_ids = sorted(
-            {item.authorization_id for item in resv.items}
-        )
-        for auth_id in auth_ids:
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth_id,
-                    models.Authorization.reserved_count >= 1,
-                )
-                .values(
-                    reserved_count=models.Authorization.reserved_count - 1
-                )
+        cancel_now = utcnow()
+        for item in sorted(resv.items, key=lambda it: it.authorization_id):
+            auth_id = item.authorization_id
+            changed = ledger.bump_counters(
+                db,
+                auth_id,
+                reserved_delta=-1,
+                guard_sql="reserved_count >= 1",
             )
-            if result.rowcount != 1:
+            if changed is None:
                 db.rollback()
                 raise RuntimeError(
                     f"取消预留失败：授权 {auth_id} reserved_count 异常"
                 )
+            before, after = changed
+            ledger.record_quota_change(
+                db,
+                authorization_id=auth_id,
+                event_type=ledger.EVENT_RESERVATION_CANCELLED,
+                ref_type="reservation",
+                ref_id=reservation_id,
+                occurred_at=cancel_now,
+                before=before,
+                after=after,
+                detail={
+                    "reservation_id": reservation_id,
+                    "item_index": item.item_index,
+                },
+            )
 
         resv.status = "cancelled"
-        resv.cancelled_at = utcnow()
+        resv.cancelled_at = cancel_now
         db.flush()
 
         # 取消预留释放额度后，按受理顺序重算本通道候补队首；冻结期间
@@ -1756,7 +1887,18 @@ def migrate_authorization(
             )
 
         # 9) 一次性搬移：明细归属改替代授权；原授权条件减 n；
-        #    替代授权条件加 n（含预留护栏）；原授权停用。
+        #    替代授权条件加 n（含预留护栏）；原授权停用。改挂业务记录
+        #    先行落库（事务内），为两端流水提供关联业务编号；提交失败
+        #    则记录与次数一起回滚（拒绝不留痕）。
+        migration = models.AuthorizationMigration(
+            source_authorization_id=source_id,
+            replacement_authorization_id=target_id,
+            migrated_count=n,
+        )
+        db.add(migration)
+        db.flush()
+        migrate_now = utcnow()
+
         if n:
             moved = db.execute(
                 update(models.DistributionItem)
@@ -1772,39 +1914,59 @@ def migrate_authorization(
                     f"改挂明细数异常：期望 {n}，实际 {moved.rowcount}"
                 )
 
-            dec = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == source_id,
-                    models.Authorization.used_count >= n,
-                )
-                .values(
-                    used_count=models.Authorization.used_count - n
-                )
+            dec_out = ledger.bump_counters(
+                db,
+                source_id,
+                used_delta=-n,
+                guard_sql=f"used_count >= {n}",
             )
-            if dec.rowcount != 1:
+            if dec_out is None:
                 db.rollback()
                 raise RuntimeError(
                     f"原授权 {source_id} 迁出次数异常（used_count < {n}）"
                 )
+            before_source, after_source = dec_out
 
-            inc = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == target_id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    <= models.Authorization.max_count - n,
-                )
-                .values(
-                    used_count=models.Authorization.used_count + n
-                )
+            inc_in = ledger.bump_counters(
+                db,
+                target_id,
+                used_delta=n,
+                guard_sql=(
+                    "used_count + reserved_count <= max_count - "
+                    f"{n}"
+                ),
             )
-            if inc.rowcount != 1:
+            if inc_in is None:
                 db.rollback()
                 raise RuntimeError(
                     f"替代授权 {target_id} 余量不足，迁入 {n} 条失败"
                 )
+            before_target, after_target = inc_in
+
+            ledger.record_quota_change(
+                db,
+                authorization_id=source_id,
+                event_type=ledger.EVENT_MIGRATE_OUT,
+                ref_type="authorization_migration",
+                ref_id=migration.id,
+                occurred_at=migrate_now,
+                before=before_source,
+                after=after_source,
+                counterparty_authorization_id=target_id,
+                detail={"migrated_count": n},
+            )
+            ledger.record_quota_change(
+                db,
+                authorization_id=target_id,
+                event_type=ledger.EVENT_MIGRATE_IN,
+                ref_type="authorization_migration",
+                ref_id=migration.id,
+                occurred_at=migrate_now,
+                before=before_target,
+                after=after_target,
+                counterparty_authorization_id=source_id,
+                detail={"migrated_count": n},
+            )
 
         source.status = "inactive"
         db.flush()
@@ -2024,44 +2186,10 @@ def transfer_quota(db: Session, data: QuotaTransferCreate) -> dict:
                 f"max_count {source.max_count} - {count} 应 >= 1",
             )
 
-        # 9) 原子更新两端 max_count：条件更新 + 断言影响行数，作为
+        # 9) 原子更新两端 max_count：条件更新 + RETURNING 护栏，作为
         #    绝不超额转拨的最后防线（与既有占额/释放口径一致）。
-        dec = db.execute(
-            update(models.Authorization)
-            .where(
-                models.Authorization.id == source_id,
-                models.Authorization.max_count
-                - models.Authorization.used_count
-                - models.Authorization.reserved_count
-                >= count,
-                models.Authorization.max_count - count >= 1,
-            )
-            .values(max_count=models.Authorization.max_count - count)
-        )
-        if dec.rowcount != 1:
-            db.rollback()
-            raise RuntimeError(
-                f"转拨失败：源授权 {source_id} 可转出量不足 {count}"
-            )
-        inc = db.execute(
-            update(models.Authorization)
-            .where(models.Authorization.id == target_id)
-            .values(max_count=models.Authorization.max_count + count)
-        )
-        if inc.rowcount != 1:
-            db.rollback()
-            raise RuntimeError(f"转拨失败：目标授权 {target_id} 更新异常")
-
-        # 10) 同事务重算本通道候补：目标新增余量优先供仍有效的队首，
-        #     过期或失配者依既有规则出队（成交会消耗两端计数）。
-        _process_waitlist(db, region, channel, now)
-
-        # 11) 重锁两端读取转拨后（含候补重算）最新计数，落库转拨记录
-        #     与两端快照；操作号唯一约束兜底并发同号（跨通道或预检间隙）。
-        locked_rows = _lock_authorizations(db, [source_id, target_id])
-        by_id = {a.id: a for a in locked_rows}
-        source = by_id[source_id]
-        target = by_id[target_id]
+        #    转拨记录先行落库（事务内）：两端流水的关联业务编号即操作号，
+        #    快照列在同事务候补重算后回填；提交失败则一并回滚。
         transfer = models.QuotaTransfer(
             operation_no=operation_no,
             region=region,
@@ -2069,14 +2197,91 @@ def transfer_quota(db: Session, data: QuotaTransferCreate) -> dict:
             source_authorization_id=source_id,
             target_authorization_id=target_id,
             count=count,
-            source_max_count=source.max_count,
-            source_used_count=source.used_count,
-            source_reserved_count=source.reserved_count,
-            target_max_count=target.max_count,
-            target_used_count=target.used_count,
-            target_reserved_count=target.reserved_count,
+            source_max_count=0,
+            source_used_count=0,
+            source_reserved_count=0,
+            target_max_count=0,
+            target_used_count=0,
+            target_reserved_count=0,
         )
         db.add(transfer)
+        db.flush()
+        transfer_now = utcnow()
+
+        dec = ledger.bump_counters(
+            db,
+            source_id,
+            max_delta=-count,
+            guard_sql=(
+                "max_count - used_count - reserved_count >= "
+                f"{count} AND max_count - {count} >= 1"
+            ),
+        )
+        if dec is None:
+            db.rollback()
+            raise RuntimeError(
+                f"转拨失败：源授权 {source_id} 可转出量不足 {count}"
+            )
+        before_source, after_source = dec
+        inc = ledger.bump_counters(
+            db,
+            target_id,
+            max_delta=count,
+        )
+        if inc is None:
+            db.rollback()
+            raise RuntimeError(f"转拨失败：目标授权 {target_id} 更新异常")
+        before_target, after_target = inc
+
+        ledger.record_quota_change(
+            db,
+            authorization_id=source_id,
+            event_type=ledger.EVENT_TRANSFER_OUT,
+            ref_type="quota_transfer",
+            ref_id=transfer.id,
+            occurred_at=transfer_now,
+            before=before_source,
+            after=after_source,
+            counterparty_authorization_id=target_id,
+            detail={
+                "operation_no": operation_no,
+                "transfer_id": transfer.id,
+                "count": count,
+            },
+        )
+        ledger.record_quota_change(
+            db,
+            authorization_id=target_id,
+            event_type=ledger.EVENT_TRANSFER_IN,
+            ref_type="quota_transfer",
+            ref_id=transfer.id,
+            occurred_at=transfer_now,
+            before=before_target,
+            after=after_target,
+            counterparty_authorization_id=source_id,
+            detail={
+                "operation_no": operation_no,
+                "transfer_id": transfer.id,
+                "count": count,
+            },
+        )
+
+        # 10) 同事务重算本通道候补：目标新增余量优先供仍有效的队首，
+        #     过期或失配者依既有规则出队（成交会消耗两端计数）。
+        _process_waitlist(db, region, channel, now)
+
+        # 11) 重锁两端读取转拨后（含候补重算）最新计数，回填转拨记录
+        #     两端快照；操作号唯一约束兜底并发同号（跨通道或预检间隙）。
+        locked_rows = _lock_authorizations(db, [source_id, target_id])
+        by_id = {a.id: a for a in locked_rows}
+        source = by_id[source_id]
+        target = by_id[target_id]
+        transfer.source_max_count = source.max_count
+        transfer.source_used_count = source.used_count
+        transfer.source_reserved_count = source.reserved_count
+        transfer.target_max_count = target.max_count
+        transfer.target_used_count = target.used_count
+        transfer.target_reserved_count = target.reserved_count
         try:
             db.commit()
         except IntegrityError:
@@ -2181,32 +2386,6 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
             return _load_waitlist(db, waitlist.id)
 
         # 全部可承接：与直接申请一致地条件占额并生成 approved 申请。
-        for auth in chosen.values():
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth.id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(used_count=models.Authorization.used_count + 1)
-            )
-            if result.rowcount != 1:
-                db.rollback()
-                raise WaitlistRejected(
-                    [
-                        {
-                            "material_id": auth.material_id,
-                            "reason": "quota_exhausted",
-                            "message": (
-                                f"授权 id={auth.id} 余量不足，"
-                                "并发占用冲突，本次候补整体拒绝"
-                            ),
-                        }
-                    ]
-                )
-
         distribution = models.Distribution(
             region=data.region,
             channel=data.channel,
@@ -2224,6 +2403,7 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
                     item_index=index,
                 )
             )
+
         waitlist = models.Waitlist(
             region=data.region,
             channel=data.channel,
@@ -2236,6 +2416,47 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
         )
         db.add(waitlist)
         db.flush()
+
+        # 占额在申请/候补落库之后进行，使流水可同时关联候补编号与
+        # 成交生成的申请编号。
+        for index, mid in enumerate(material_ids):
+            auth = chosen[mid]
+            changed = ledger.bump_counters(
+                db,
+                auth.id,
+                used_delta=1,
+                guard_sql="used_count + reserved_count < max_count",
+            )
+            if changed is None:
+                db.rollback()
+                raise WaitlistRejected(
+                    [
+                        {
+                            "material_id": auth.material_id,
+                            "reason": "quota_exhausted",
+                            "message": (
+                                f"授权 id={auth.id} 余量不足，"
+                                "并发占用冲突，本次候补整体拒绝"
+                            ),
+                        }
+                    ]
+                )
+            before, after = changed
+            ledger.record_quota_change(
+                db,
+                authorization_id=auth.id,
+                event_type=ledger.EVENT_WAITLIST_FULFILLMENT,
+                ref_type="waitlist",
+                ref_id=waitlist.id,
+                occurred_at=now,
+                before=before,
+                after=after,
+                detail={
+                    "waitlist_id": waitlist.id,
+                    "distribution_id": distribution.id,
+                    "item_index": index,
+                },
+            )
         db.commit()
     except (ChannelFrozen, WaitlistRejected):
         raise
@@ -2434,6 +2655,31 @@ def cancel_waitlist(db: Session, waitlist_id: int) -> models.Waitlist:
         raise
 
     return _load_waitlist(db, waitlist_id)
+
+
+# ============================================================ 额度账本查询
+LEDGER_MAX_PAGE_SIZE = 100
+LEDGER_DEFAULT_PAGE_SIZE = 20
+
+
+def get_authorization_ledger_page(
+    db: Session,
+    authorization_id: int,
+    *,
+    cursor: str | None,
+    page_size: int,
+) -> dict:
+    """按授权编号 + 游标 + 页大小查询额度账本（只读，不触发惰性结算）。
+
+    - 未知授权（无期初行）→ 404 ``not_found``；
+    - 游标不可解析/不属于该授权 → 422 ``invalid_ledger_cursor``；
+    - 页大小越界 → 422 ``invalid_page_size``。
+    """
+    if not 1 <= page_size <= LEDGER_MAX_PAGE_SIZE:
+        raise InvalidLedgerPageSize(page_size, LEDGER_MAX_PAGE_SIZE)
+    return ledger.get_authorization_ledger(
+        db, authorization_id, cursor=cursor, page_size=page_size
+    )
 
 
 # ============================================================ 通道额度冻结
