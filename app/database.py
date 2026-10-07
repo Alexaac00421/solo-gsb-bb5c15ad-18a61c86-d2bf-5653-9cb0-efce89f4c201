@@ -50,9 +50,11 @@ def _upgrade_existing_tables(bind) -> None:
     预留功能为 ``authorizations`` 增加了 ``reserved_count`` 列与
     ``ck_auth_reserved_invariant`` 约束；候补有效期功能为 ``waitlists``
     增加了 ``ttl_minutes`` / ``expires_at`` / ``expiry_reason`` /
-    ``expired_at`` 列，并扩展状态约束以纳入 ``expired`` 终态。
-    新建库由 ``create_all`` 直接建出，旧库则在此幂等补齐
-    （列/约束存在时跳过）。
+    ``expired_at`` 列，并扩展状态约束以纳入 ``expired`` 终态；
+    额度账本功能新增 ``quota_ledger_accounts`` / ``quota_ledger_entries``
+    表（由 ``create_all`` 建出），并为启用前已存在的授权按当前三项计数
+    幂等开立账本账户（期初余额）。新建库由 ``create_all`` 直接建出，
+    旧库则在此幂等补齐（列/约束/表/账户行已存在则跳过）。
     """
     from sqlalchemy import text
 
@@ -153,6 +155,23 @@ def _upgrade_existing_tables(bind) -> None:
                         f"ALTER TABLE waitlists ADD CONSTRAINT {name} {ddl}"
                     )
                 )
+
+        # 额度账本：为功能启用前已存在的授权幂等开立账户——
+        # 期初余额取启用时刻的 (used_count, reserved_count, max_count)，
+        # 启用前的历史变化不追溯；已开立的授权跳过（幂等）。
+        conn.execute(
+            text(
+                "INSERT INTO quota_ledger_accounts "
+                "(authorization_id, opening_max_count, opening_used_count, "
+                " opening_reserved_count, opened_at, entry_count) "
+                "SELECT a.id, a.max_count, a.used_count, a.reserved_count, "
+                "       now(), 0 "
+                "FROM authorizations a "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM quota_ledger_accounts q "
+                "  WHERE q.authorization_id = a.id)"
+            )
+        )
 
 
 def get_db():

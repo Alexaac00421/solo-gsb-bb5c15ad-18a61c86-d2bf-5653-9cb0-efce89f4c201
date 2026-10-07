@@ -325,3 +325,19 @@ class TransferOperationConflict(APIError):
                 "相同操作号必须以相同参数重放"
             ),
         )
+
+
+# ----------------------------------------------------------------- 额度账本
+class InvalidLedgerCursor(APIError):
+    """账本查询游标无法解析（格式非法或锚点流水不存在）。"""
+
+    def __init__(self, cursor: str):
+        shown = cursor if len(cursor) <= 100 else cursor[:100] + "..."
+        super().__init__(
+            status_code=422,
+            code="invalid_ledger_cursor",
+            message=(
+                f"无效的账本查询游标：{shown!r}；"
+                "请使用上一页响应返回的 next_cursor 继续翻页"
+            ),
+        )

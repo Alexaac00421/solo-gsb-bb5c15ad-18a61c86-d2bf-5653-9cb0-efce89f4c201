@@ -467,3 +467,67 @@ class QuotaTransferOut(BaseModel):
         description="目标授权（转入方）转拨后的额度与占用快照"
     )
     created_at: datetime = Field(description="首次转拨完成时刻（带时区）")
+
+
+# ----------------------------------------------------------------- 额度账本
+class LedgerBalanceOut(BaseModel):
+    """三项计数余额（已用 / 预留 / 总额度）。"""
+
+    max_count: int
+    used_count: int
+    reserved_count: int
+
+
+class LedgerOpeningOut(LedgerBalanceOut):
+    """期初余额：启用时已有授权取启用时计数；新授权取创建时计数。"""
+
+    opened_at: datetime = Field(description="期初开立时刻（带时区）")
+
+
+class LedgerEntryOut(BaseModel):
+    """一笔不可改写的额度流水：三项计数变化前后值、关联业务编号与时刻。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    seq: int = Field(description="授权内流水序号（自 1 起单调递增）")
+    entry_type: str = Field(
+        description=(
+            "变化来源：distribution_commit / distribution_revoke / "
+            "distribution_reschedule_out / distribution_reschedule_in / "
+            "waitlist_fulfill / reservation_create / reservation_confirm / "
+            "reservation_cancel / reservation_expire / "
+            "migration_out / migration_in / transfer_out / transfer_in"
+        )
+    )
+    biz_id: int | None = Field(
+        default=None,
+        description="关联业务编号：申请/预留/候补主键；改挂与转拨为对端授权编号",
+    )
+    biz_ref: str | None = Field(
+        default=None,
+        description="补充业务标识：候补成交生成的申请、转拨操作号、改挂方向",
+    )
+    used_before: int
+    used_after: int
+    reserved_before: int
+    reserved_after: int
+    max_before: int
+    max_after: int
+    occurred_at: datetime = Field(description="业务发生时刻（带时区）")
+
+
+class LedgerPageOut(BaseModel):
+    """授权额度账本一页：期初余额 + 逐笔流水 + 页末余额 + 下一游标。"""
+
+    authorization_id: int
+    opening: LedgerOpeningOut = Field(description="期初余额")
+    entries: list[LedgerEntryOut] = Field(description="本页逐笔流水（按发生顺序）")
+    page_end: LedgerBalanceOut = Field(
+        description="页末余额：本页最后一笔流水变化后的三项计数；"
+        "本页为空时为页起点余额（首页即期初）"
+    )
+    next_cursor: str | None = Field(
+        default=None,
+        description="下一页游标；为 null 表示本次翻页已结束。"
+        "首次查询已固定上界，后续写入不会混入本次翻页",
+    )

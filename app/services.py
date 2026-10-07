@@ -63,6 +63,8 @@ approved 申请）；每项均有匹配授权但额度不足才入本通道队�
 """
 from collections import Counter
 from datetime import datetime, timedelta, timezone
+import base64
+import json
 from zlib import crc32
 
 from sqlalchemy import select, text, update
@@ -77,6 +79,7 @@ from app.errors import (
     DistributionRejected,
     DistributionRevoked,
     DuplicateMaterialItems,
+    InvalidLedgerCursor,
     InvalidReservationStatus,
     InvalidWaitlistStatus,
     MigrationRejected,
@@ -148,6 +151,19 @@ def create_authorization(
         max_count=data.max_count,
     )
     db.add(auth)
+    db.flush()
+    # 额度账本：新授权自创建时的计数（used=0、reserved=0、max=max_count）
+    # 起算期初，与授权登记同事务开立账户（同成同败）。
+    db.add(
+        models.QuotaLedgerAccount(
+            authorization_id=auth.id,
+            opening_max_count=auth.max_count,
+            opening_used_count=0,
+            opening_reserved_count=0,
+            opened_at=auth.created_at,
+            entry_count=0,
+        )
+    )
     db.commit()
     db.refresh(auth)
     return auth
@@ -382,6 +398,243 @@ def _lock_authorizations(
     )
 
 
+# ================================================================= 额度账本
+# 三项计数（used / reserved / max）的每一次变化都在原业务事务内同步记为
+# 不可改写的逐笔流水：与原业务同成同败，拒绝、回滚、幂等重放均不留流水。
+def _apply_counter_delta(
+    db: Session,
+    authorization_id: int,
+    deltas: dict[str, int],
+    *conditions,
+) -> tuple[int, tuple[int, int, int] | None, tuple[int, int, int] | None]:
+    """对授权三项计数做带护栏的条件更新，返回 ``(影响行数, before, after)``。
+
+    ``deltas`` 形如 ``{"used_count": 1}``；``before``/``after`` 为
+    ``(used, reserved, max)`` 三元组。借助 ``RETURNING`` 取回更新后的
+    三项计数，``before`` 由 ``after`` 反推 ``deltas`` 得到（同通道写
+    事务经咨询锁串行，同事务内无其他写入，反推精确）。未命中护栏条件
+    时返回 ``(0, None, None)``，调用方按既有约定回滚或拒绝。
+    """
+    stmt = (
+        update(models.Authorization)
+        .where(models.Authorization.id == authorization_id, *conditions)
+        .values(
+            **{
+                column: getattr(models.Authorization, column) + delta
+                for column, delta in deltas.items()
+            }
+        )
+        .returning(
+            models.Authorization.used_count,
+            models.Authorization.reserved_count,
+            models.Authorization.max_count,
+        )
+    )
+    rows = db.execute(stmt).all()
+    if len(rows) != 1:
+        return 0, None, None
+    used_after, reserved_after, max_after = rows[0]
+    before = (
+        used_after - deltas.get("used_count", 0),
+        reserved_after - deltas.get("reserved_count", 0),
+        max_after - deltas.get("max_count", 0),
+    )
+    return 1, before, (used_after, reserved_after, max_after)
+
+
+def _add_ledger_entry(
+    db: Session,
+    *,
+    authorization_id: int,
+    entry_type: str,
+    before: tuple[int, int, int],
+    after: tuple[int, int, int],
+    occurred_at: datetime,
+    biz_id: int | None = None,
+    biz_ref: str | None = None,
+) -> None:
+    """在业务事务内追加一条不可改写流水（与业务同事务提交/回滚）。
+
+    ``before``/``after`` 为 ``(used, reserved, max)`` 三元组；流水序号
+    ``seq`` 取自账户行计数器（同事务串行 +1，单调无空洞）。账户行缺失
+    属数据异常（启动迁移与新授权登记均已保证开立），直接回滚报错。
+    """
+    seq = db.execute(
+        update(models.QuotaLedgerAccount)
+        .where(
+            models.QuotaLedgerAccount.authorization_id == authorization_id
+        )
+        .values(entry_count=models.QuotaLedgerAccount.entry_count + 1)
+        .returning(models.QuotaLedgerAccount.entry_count)
+    ).scalar_one_or_none()
+    if seq is None:
+        db.rollback()
+        raise RuntimeError(f"额度账本账户缺失：授权 {authorization_id}")
+    db.add(
+        models.QuotaLedgerEntry(
+            authorization_id=authorization_id,
+            seq=seq,
+            entry_type=entry_type,
+            biz_id=biz_id,
+            biz_ref=biz_ref,
+            used_before=before[0],
+            used_after=after[0],
+            reserved_before=before[1],
+            reserved_after=after[1],
+            max_before=before[2],
+            max_after=after[2],
+            occurred_at=occurred_at,
+        )
+    )
+
+
+# 账本游标：不透明字符串，内含「已读到的最后一笔序号」与「首次查询固定的
+# 上界序号」，后续翻页不受新写入影响。
+_LEDGER_CURSOR_VERSION = 1
+
+
+def _encode_ledger_cursor(last_seq: int, upper_seq: int) -> str:
+    payload = json.dumps(
+        {"v": _LEDGER_CURSOR_VERSION, "last": last_seq, "upper": upper_seq},
+        separators=(",", ":"),
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _decode_ledger_cursor(cursor: str) -> tuple[int, int]:
+    """解析翻页游标为 ``(last_seq, upper_seq)``；任何非法输入明确报错。"""
+    try:
+        payload = json.loads(
+            base64.urlsafe_b64decode(cursor.encode("ascii")).decode("utf-8")
+        )
+        last = payload["last"]
+        upper = payload["upper"]
+        # bool 是 int 子类，须显式排除；序号非负且 last 不得越过 upper。
+        if (
+            payload.get("v") != _LEDGER_CURSOR_VERSION
+            or not isinstance(last, int)
+            or not isinstance(upper, int)
+            or isinstance(last, bool)
+            or isinstance(upper, bool)
+            or last < 0
+            or upper < 0
+            or last > upper
+        ):
+            raise ValueError("cursor fields invalid")
+    except Exception:
+        raise InvalidLedgerCursor(cursor)
+    return last, upper
+
+
+def get_authorization_ledger(
+    db: Session,
+    authorization_id: int,
+    cursor: str | None,
+    page_size: int,
+) -> dict:
+    """按授权编号分页查询额度账本：期初余额 + 逐笔流水 + 页末余额 + 游标。
+
+    - 首次查询（无游标）以当前最新流水序号为**固定上界**，本次翻页期间
+      的新写入不会混入；后续页凭 ``next_cursor`` 继续，相邻页余额连续
+      （上页页末余额 = 下页首笔流水的变化前值）；
+    - 页末余额为本页最后一笔流水变化后的三项计数；本页无流水时为页起点
+      余额（首页即期初余额）；
+    - 授权不存在 → 404；游标无法解析或锚点流水不存在 → 422
+      ``invalid_ledger_cursor``。
+    """
+    auth = db.get(models.Authorization, authorization_id)
+    if auth is None:
+        raise ResourceNotFound("授权", authorization_id)
+    account = db.get(models.QuotaLedgerAccount, authorization_id)
+
+    if cursor is None:
+        last_seq = 0
+        # 固定上界：本次翻页只见该序号之前的流水，后续写入不混入。
+        upper_seq = account.entry_count if account is not None else 0
+    else:
+        last_seq, upper_seq = _decode_ledger_cursor(cursor)
+
+    # 页起点余额：首页为期初；后续页为游标锚点流水变化后的值。
+    if last_seq == 0:
+        if account is not None:
+            start_balance = (
+                account.opening_used_count,
+                account.opening_reserved_count,
+                account.opening_max_count,
+            )
+        else:
+            # 防御：账户行缺失（正常不会发生）时按当前计数即时呈现。
+            start_balance = (
+                auth.used_count,
+                auth.reserved_count,
+                auth.max_count,
+            )
+    else:
+        anchor = db.scalar(
+            select(models.QuotaLedgerEntry).where(
+                models.QuotaLedgerEntry.authorization_id == authorization_id,
+                models.QuotaLedgerEntry.seq == last_seq,
+            )
+        )
+        if anchor is None:
+            raise InvalidLedgerCursor(cursor)
+        start_balance = (
+            anchor.used_after,
+            anchor.reserved_after,
+            anchor.max_after,
+        )
+
+    rows = list(
+        db.scalars(
+            select(models.QuotaLedgerEntry)
+            .where(
+                models.QuotaLedgerEntry.authorization_id == authorization_id,
+                models.QuotaLedgerEntry.seq > last_seq,
+                models.QuotaLedgerEntry.seq <= upper_seq,
+            )
+            .order_by(models.QuotaLedgerEntry.seq.asc())
+            .limit(page_size + 1)
+        )
+    )
+    has_more = len(rows) > page_size
+    page = rows[:page_size]
+    if page:
+        tail = page[-1]
+        end_balance = (tail.used_after, tail.reserved_after, tail.max_after)
+        next_cursor = (
+            _encode_ledger_cursor(tail.seq, upper_seq) if has_more else None
+        )
+    else:
+        end_balance = start_balance
+        next_cursor = None
+
+    if account is not None:
+        opening = {
+            "max_count": account.opening_max_count,
+            "used_count": account.opening_used_count,
+            "reserved_count": account.opening_reserved_count,
+            "opened_at": account.opened_at,
+        }
+    else:
+        opening = {
+            "max_count": auth.max_count,
+            "used_count": auth.used_count,
+            "reserved_count": auth.reserved_count,
+            "opened_at": auth.created_at,
+        }
+    return {
+        "authorization_id": authorization_id,
+        "opening": opening,
+        "entries": page,
+        "page_end": {
+            "max_count": end_balance[2],
+            "used_count": end_balance[0],
+            "reserved_count": end_balance[1],
+        },
+        "next_cursor": next_cursor,
+    }
+
+
 def _settle_expired(
     db: Session,
     now: datetime,
@@ -420,7 +673,9 @@ def _settle_expired(
         )
     expiring = list(db.scalars(resv_stmt))
 
+    # 逐预留收集涉及授权（保持流水顺序：预留 id 升序、明细 id 升序）。
     auth_counts: Counter[int] = Counter()
+    expire_items: list[tuple[int, list[int]]] = []
     for resv in expiring:
         items = list(
             db.scalars(
@@ -431,28 +686,57 @@ def _settle_expired(
                 .order_by(models.ReservationItem.id.asc())
             )
         )
-        auth_counts.update(item.authorization_id for item in items)
+        auth_ids = [item.authorization_id for item in items]
+        auth_counts.update(auth_ids)
+        expire_items.append((resv.id, auth_ids))
 
     lock_ids = sorted(set(auth_counts) | set(extra_auth_ids or []))
     locked = _lock_authorizations(db, lock_ids)
 
+    # 以锁定行的当前计数为起点，逐预留计算 (used, reserved, max) 变化链；
+    # 聚合条件更新执行后按链逐笔记流水（到期释放，reserved_count - 1）。
+    locked_by_id = {a.id: a for a in locked}
+    running = {aid: locked_by_id[aid].reserved_count for aid in auth_counts}
+    expire_entries: list[tuple[int, tuple, tuple, int]] = []
+    for resv_id, auth_ids in expire_items:
+        for auth_id in auth_ids:
+            auth = locked_by_id[auth_id]
+            before = (auth.used_count, running[auth_id], auth.max_count)
+            running[auth_id] -= 1
+            after = (auth.used_count, running[auth_id], auth.max_count)
+            expire_entries.append((auth_id, before, after, resv_id))
+
     # 条件归还：每个授权按到期预留条数一次性扣减 reserved_count。
     for auth_id, n in auth_counts.items():
-        result = db.execute(
-            update(models.Authorization)
-            .where(
-                models.Authorization.id == auth_id,
-                models.Authorization.reserved_count >= n,
-            )
-            .values(
-                reserved_count=models.Authorization.reserved_count - n
-            )
+        applied, _, after3 = _apply_counter_delta(
+            db,
+            auth_id,
+            {"reserved_count": -n},
+            models.Authorization.reserved_count >= n,
         )
-        if result.rowcount != 1:
+        if applied != 1:
             db.rollback()
             raise RuntimeError(
                 f"到期释放失败：授权 {auth_id} reserved_count 不足 {n}"
             )
+        if after3[1] != running[auth_id]:
+            db.rollback()
+            raise RuntimeError(
+                f"到期释放账本不一致：授权 {auth_id} "
+                f"期望 reserved={running[auth_id]}，实际 {after3[1]}"
+            )
+
+    # 逐笔流水：每条到期预留对其命中的每个授权记一笔 reservation_expire。
+    for auth_id, before, after, resv_id in expire_entries:
+        _add_ledger_entry(
+            db,
+            authorization_id=auth_id,
+            entry_type="reservation_expire",
+            biz_id=resv_id,
+            before=before,
+            after=after,
+            occurred_at=now,
+        )
 
     if expiring:
         db.execute(
@@ -700,22 +984,22 @@ def _process_waitlist(
             return fulfilled
 
         # 整体可承接：条件占额（护栏断言），生成一笔 approved 申请。
+        quota_changes: list[tuple[int, tuple, tuple]] = []
         for auth in chosen.values():
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth.id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(used_count=models.Authorization.used_count + 1)
+            applied, before, after = _apply_counter_delta(
+                db,
+                auth.id,
+                {"used_count": 1},
+                models.Authorization.used_count
+                + models.Authorization.reserved_count
+                < models.Authorization.max_count,
             )
-            if result.rowcount != 1:
+            if applied != 1:
                 db.rollback()
                 raise RuntimeError(
                     f"候补成交失败：授权 {auth.id} 余量不足"
                 )
+            quota_changes.append((auth.id, before, after))
 
         distribution = models.Distribution(
             region=region,
@@ -734,9 +1018,22 @@ def _process_waitlist(
                     item_index=index,
                 )
             )
+        fulfilled_at = utcnow()
         head.status = "fulfilled"
         head.distribution_id = distribution.id
-        head.fulfilled_at = utcnow()
+        head.fulfilled_at = fulfilled_at
+        # 逐笔流水：候补成交（used+1），关联候补编号与生成的申请编号。
+        for auth_id, before, after in quota_changes:
+            _add_ledger_entry(
+                db,
+                authorization_id=auth_id,
+                entry_type="waitlist_fulfill",
+                biz_id=head.id,
+                biz_ref=f"distribution:{distribution.id}",
+                before=before,
+                after=after,
+                occurred_at=fulfilled_at,
+            )
         db.flush()
         fulfilled += 1
 
@@ -796,18 +1093,17 @@ def create_distribution(
             raise DistributionRejected(reasons)
 
         # 5) 条件占用正式次数（含预留占用护栏），断言影响行数。
+        quota_changes: list[tuple[int, tuple, tuple]] = []
         for auth in chosen.values():
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth.id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(used_count=models.Authorization.used_count + 1)
+            applied, before, after = _apply_counter_delta(
+                db,
+                auth.id,
+                {"used_count": 1},
+                models.Authorization.used_count
+                + models.Authorization.reserved_count
+                < models.Authorization.max_count,
             )
-            if result.rowcount != 1:
+            if applied != 1:
                 db.rollback()
                 raise DistributionRejected(
                     [
@@ -821,6 +1117,7 @@ def create_distribution(
                         }
                     ]
                 )
+            quota_changes.append((auth.id, before, after))
 
         # 6) 落库申请及逐项占用记录。
         distribution = models.Distribution(
@@ -839,6 +1136,17 @@ def create_distribution(
                     authorization_id=chosen[mid].id,
                     item_index=index,
                 )
+            )
+        # 逐笔流水：直接发行占用（used+1），关联申请编号。
+        for auth_id, before, after in quota_changes:
+            _add_ledger_entry(
+                db,
+                authorization_id=auth_id,
+                entry_type="distribution_commit",
+                biz_id=distribution.id,
+                before=before,
+                after=after,
+                occurred_at=distribution.created_at,
             )
         db.commit()
     except (ChannelFrozen, DistributionRejected):
@@ -937,25 +1245,35 @@ def revoke_distribution(
 
         # 同一授权在本申请中至多出现一次（素材已去重），逐项释放。
         # 条件 ``used_count >= 1`` 作为不重复释放/账实相符的最后防线。
+        revoked_at = utcnow()
+        quota_changes: list[tuple[int, tuple, tuple]] = []
         for auth_id in auth_ids:
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth_id,
-                    models.Authorization.used_count >= 1,
-                )
-                .values(
-                    used_count=models.Authorization.used_count - 1
-                )
+            applied, before, after = _apply_counter_delta(
+                db,
+                auth_id,
+                {"used_count": -1},
+                models.Authorization.used_count >= 1,
             )
-            if result.rowcount != 1:
+            if applied != 1:
                 db.rollback()
                 raise RuntimeError(
                     f"撤销释放失败：授权 {auth_id} used_count 异常"
                 )
+            quota_changes.append((auth_id, before, after))
 
         distribution.status = "revoked"
-        distribution.revoked_at = datetime.now(timezone.utc)
+        distribution.revoked_at = revoked_at
+        # 逐笔流水：撤销释放（used-1），关联申请编号，时刻与 revoked_at 同源。
+        for auth_id, before, after in quota_changes:
+            _add_ledger_entry(
+                db,
+                authorization_id=auth_id,
+                entry_type="distribution_revoke",
+                biz_id=distribution_id,
+                before=before,
+                after=after,
+                occurred_at=revoked_at,
+            )
         db.flush()
 
         # 撤销释放额度后，按受理顺序重算本通道候补队首；冻结期间仅结算
@@ -1071,39 +1389,56 @@ def reschedule_distribution(
         # 原子搬移：归属变化的项逐条「原授权条件 -1、新授权条件 +1」，
         # 归属不变的项不动次数。素材在申请内唯一 ⇒ 每个授权在一次改期中
         # 至多作为一端出现一次，不会既加又减。
+        moved_at = utcnow()
         for item in items:
             new_auth = chosen[item.material_id]
             old_auth_id = item.authorization_id
             if new_auth.id == old_auth_id:
                 continue
-            dec = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == old_auth_id,
-                    models.Authorization.used_count >= 1,
-                )
-                .values(used_count=models.Authorization.used_count - 1)
+            applied, before, after = _apply_counter_delta(
+                db,
+                old_auth_id,
+                {"used_count": -1},
+                models.Authorization.used_count >= 1,
             )
-            if dec.rowcount != 1:
+            if applied != 1:
                 db.rollback()
                 raise RuntimeError(
                     f"改期迁出失败：授权 {old_auth_id} used_count 异常"
                 )
-            inc = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == new_auth.id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(used_count=models.Authorization.used_count + 1)
+            # 逐笔流水：改期迁出（原授权 used-1）。
+            _add_ledger_entry(
+                db,
+                authorization_id=old_auth_id,
+                entry_type="distribution_reschedule_out",
+                biz_id=distribution_id,
+                before=before,
+                after=after,
+                occurred_at=moved_at,
             )
-            if inc.rowcount != 1:
+            applied, before, after = _apply_counter_delta(
+                db,
+                new_auth.id,
+                {"used_count": 1},
+                models.Authorization.used_count
+                + models.Authorization.reserved_count
+                < models.Authorization.max_count,
+            )
+            if applied != 1:
                 db.rollback()
                 raise RuntimeError(
                     f"改期迁入失败：授权 {new_auth.id} 余量不足"
                 )
+            # 逐笔流水：改期迁入（新授权 used+1）。
+            _add_ledger_entry(
+                db,
+                authorization_id=new_auth.id,
+                entry_type="distribution_reschedule_in",
+                biz_id=distribution_id,
+                before=before,
+                after=after,
+                occurred_at=moved_at,
+            )
             item.authorization_id = new_auth.id
 
         distribution.occur_at = data.occur_at
@@ -1181,19 +1516,15 @@ def create_reservation(db: Session, data: ReservationCreate) -> models.Reservati
         # 素材已去重，同一授权在一次预留中至多被选中一次。
         for index, mid in enumerate(material_ids):
             auth = chosen[mid]
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth.id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(
-                    reserved_count=models.Authorization.reserved_count + 1
-                )
+            applied, before, after = _apply_counter_delta(
+                db,
+                auth.id,
+                {"reserved_count": 1},
+                models.Authorization.used_count
+                + models.Authorization.reserved_count
+                < models.Authorization.max_count,
             )
-            if result.rowcount != 1:
+            if applied != 1:
                 db.rollback()
                 raise ReservationRejected(
                     [
@@ -1215,6 +1546,16 @@ def create_reservation(db: Session, data: ReservationCreate) -> models.Reservati
                     authorization_id=auth.id,
                     item_index=index,
                 )
+            )
+            # 逐笔流水：预留占用（reserved+1），关联预留编号。
+            _add_ledger_entry(
+                db,
+                authorization_id=auth.id,
+                entry_type="reservation_create",
+                biz_id=reservation.id,
+                before=before,
+                after=after,
+                occurred_at=reservation.created_at,
             )
         db.commit()
     except (ChannelFrozen, ReservationRejected):
@@ -1425,36 +1766,40 @@ def confirm_reservation(
         # （条件 used + reserved < max，即槽位确实来自本预留），
         # 占用总量不变，绝不超额、不重复。
         for auth_id in auth_ids:
-            dec = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth_id,
-                    models.Authorization.reserved_count >= 1,
-                )
-                .values(
-                    reserved_count=models.Authorization.reserved_count - 1
-                )
+            applied, before, _ = _apply_counter_delta(
+                db,
+                auth_id,
+                {"reserved_count": -1},
+                models.Authorization.reserved_count >= 1,
             )
-            if dec.rowcount != 1:
+            if applied != 1:
                 db.rollback()
                 raise RuntimeError(
                     f"确认预留失败：授权 {auth_id} reserved_count 异常"
                 )
-            inc = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth_id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(used_count=models.Authorization.used_count + 1)
+            applied, _, after = _apply_counter_delta(
+                db,
+                auth_id,
+                {"used_count": 1},
+                models.Authorization.used_count
+                + models.Authorization.reserved_count
+                < models.Authorization.max_count,
             )
-            if inc.rowcount != 1:
+            if applied != 1:
                 db.rollback()
                 raise RuntimeError(
                     f"确认预留失败：授权 {auth_id} 正式余量不足"
                 )
+            # 逐笔流水：预留确认（reserved-1 且 used+1，一笔记录双变化）。
+            _add_ledger_entry(
+                db,
+                authorization_id=auth_id,
+                entry_type="reservation_confirm",
+                biz_id=reservation_id,
+                before=before,
+                after=after,
+                occurred_at=now,
+            )
 
         resv.status = "confirmed"
         resv.distribution_id = distribution.id
@@ -1528,25 +1873,35 @@ def cancel_reservation(db: Session, reservation_id: int) -> models.Reservation:
         auth_ids = sorted(
             {item.authorization_id for item in resv.items}
         )
+        cancelled_at = utcnow()
+        quota_changes: list[tuple[int, tuple, tuple]] = []
         for auth_id in auth_ids:
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth_id,
-                    models.Authorization.reserved_count >= 1,
-                )
-                .values(
-                    reserved_count=models.Authorization.reserved_count - 1
-                )
+            applied, before, after = _apply_counter_delta(
+                db,
+                auth_id,
+                {"reserved_count": -1},
+                models.Authorization.reserved_count >= 1,
             )
-            if result.rowcount != 1:
+            if applied != 1:
                 db.rollback()
                 raise RuntimeError(
                     f"取消预留失败：授权 {auth_id} reserved_count 异常"
                 )
+            quota_changes.append((auth_id, before, after))
 
         resv.status = "cancelled"
-        resv.cancelled_at = utcnow()
+        resv.cancelled_at = cancelled_at
+        # 逐笔流水：取消预留（reserved-1），关联预留编号。
+        for auth_id, before, after in quota_changes:
+            _add_ledger_entry(
+                db,
+                authorization_id=auth_id,
+                entry_type="reservation_cancel",
+                biz_id=reservation_id,
+                before=before,
+                after=after,
+                occurred_at=cancelled_at,
+            )
         db.flush()
 
         # 取消预留释放额度后，按受理顺序重算本通道候补队首；冻结期间
@@ -1772,39 +2127,54 @@ def migrate_authorization(
                     f"改挂明细数异常：期望 {n}，实际 {moved.rowcount}"
                 )
 
-            dec = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == source_id,
-                    models.Authorization.used_count >= n,
-                )
-                .values(
-                    used_count=models.Authorization.used_count - n
-                )
+            migrated_at = utcnow()
+            applied, before, after = _apply_counter_delta(
+                db,
+                source_id,
+                {"used_count": -n},
+                models.Authorization.used_count >= n,
             )
-            if dec.rowcount != 1:
+            if applied != 1:
                 db.rollback()
                 raise RuntimeError(
                     f"原授权 {source_id} 迁出次数异常（used_count < {n}）"
                 )
-
-            inc = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == target_id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    <= models.Authorization.max_count - n,
-                )
-                .values(
-                    used_count=models.Authorization.used_count + n
-                )
+            # 逐笔流水：改挂迁出（原授权 used-n），关联对端授权编号。
+            _add_ledger_entry(
+                db,
+                authorization_id=source_id,
+                entry_type="migration_out",
+                biz_id=target_id,
+                biz_ref=f"migration:{source_id}->{target_id}",
+                before=before,
+                after=after,
+                occurred_at=migrated_at,
             )
-            if inc.rowcount != 1:
+
+            applied, before, after = _apply_counter_delta(
+                db,
+                target_id,
+                {"used_count": n},
+                models.Authorization.used_count
+                + models.Authorization.reserved_count
+                <= models.Authorization.max_count - n,
+            )
+            if applied != 1:
                 db.rollback()
                 raise RuntimeError(
                     f"替代授权 {target_id} 余量不足，迁入 {n} 条失败"
                 )
+            # 逐笔流水：改挂迁入（替代授权 used+n），关联对端授权编号。
+            _add_ledger_entry(
+                db,
+                authorization_id=target_id,
+                entry_type="migration_in",
+                biz_id=source_id,
+                biz_ref=f"migration:{source_id}->{target_id}",
+                before=before,
+                after=after,
+                occurred_at=migrated_at,
+            )
 
         source.status = "inactive"
         db.flush()
@@ -2026,31 +2396,49 @@ def transfer_quota(db: Session, data: QuotaTransferCreate) -> dict:
 
         # 9) 原子更新两端 max_count：条件更新 + 断言影响行数，作为
         #    绝不超额转拨的最后防线（与既有占额/释放口径一致）。
-        dec = db.execute(
-            update(models.Authorization)
-            .where(
-                models.Authorization.id == source_id,
-                models.Authorization.max_count
-                - models.Authorization.used_count
-                - models.Authorization.reserved_count
-                >= count,
-                models.Authorization.max_count - count >= 1,
-            )
-            .values(max_count=models.Authorization.max_count - count)
+        applied, before, after = _apply_counter_delta(
+            db,
+            source_id,
+            {"max_count": -count},
+            models.Authorization.max_count
+            - models.Authorization.used_count
+            - models.Authorization.reserved_count
+            >= count,
+            models.Authorization.max_count - count >= 1,
         )
-        if dec.rowcount != 1:
+        if applied != 1:
             db.rollback()
             raise RuntimeError(
                 f"转拨失败：源授权 {source_id} 可转出量不足 {count}"
             )
-        inc = db.execute(
-            update(models.Authorization)
-            .where(models.Authorization.id == target_id)
-            .values(max_count=models.Authorization.max_count + count)
+        # 逐笔流水：转拨转出（源授权 max-count），关联操作号与对端授权。
+        _add_ledger_entry(
+            db,
+            authorization_id=source_id,
+            entry_type="transfer_out",
+            biz_id=target_id,
+            biz_ref=operation_no,
+            before=before,
+            after=after,
+            occurred_at=now,
         )
-        if inc.rowcount != 1:
+        applied, before, after = _apply_counter_delta(
+            db, target_id, {"max_count": count}
+        )
+        if applied != 1:
             db.rollback()
             raise RuntimeError(f"转拨失败：目标授权 {target_id} 更新异常")
+        # 逐笔流水：转拨转入（目标授权 max+count），关联操作号与对端授权。
+        _add_ledger_entry(
+            db,
+            authorization_id=target_id,
+            entry_type="transfer_in",
+            biz_id=source_id,
+            biz_ref=operation_no,
+            before=before,
+            after=after,
+            occurred_at=now,
+        )
 
         # 10) 同事务重算本通道候补：目标新增余量优先供仍有效的队首，
         #     过期或失配者依既有规则出队（成交会消耗两端计数）。
@@ -2181,18 +2569,17 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
             return _load_waitlist(db, waitlist.id)
 
         # 全部可承接：与直接申请一致地条件占额并生成 approved 申请。
+        quota_changes: list[tuple[int, tuple, tuple]] = []
         for auth in chosen.values():
-            result = db.execute(
-                update(models.Authorization)
-                .where(
-                    models.Authorization.id == auth.id,
-                    models.Authorization.used_count
-                    + models.Authorization.reserved_count
-                    < models.Authorization.max_count,
-                )
-                .values(used_count=models.Authorization.used_count + 1)
+            applied, before, after = _apply_counter_delta(
+                db,
+                auth.id,
+                {"used_count": 1},
+                models.Authorization.used_count
+                + models.Authorization.reserved_count
+                < models.Authorization.max_count,
             )
-            if result.rowcount != 1:
+            if applied != 1:
                 db.rollback()
                 raise WaitlistRejected(
                     [
@@ -2206,6 +2593,7 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
                         }
                     ]
                 )
+            quota_changes.append((auth.id, before, after))
 
         distribution = models.Distribution(
             region=data.region,
@@ -2236,6 +2624,18 @@ def create_waitlist(db: Session, data: WaitlistCreate) -> models.Waitlist:
         )
         db.add(waitlist)
         db.flush()
+        # 逐笔流水：候补直接成交（used+1），关联候补编号与生成的申请编号。
+        for auth_id, before, after in quota_changes:
+            _add_ledger_entry(
+                db,
+                authorization_id=auth_id,
+                entry_type="waitlist_fulfill",
+                biz_id=waitlist.id,
+                biz_ref=f"distribution:{distribution.id}",
+                before=before,
+                after=after,
+                occurred_at=now,
+            )
         db.commit()
     except (ChannelFrozen, WaitlistRejected):
         raise

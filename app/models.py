@@ -433,6 +433,89 @@ class ChannelFreeze(Base):
     )
 
 
+class QuotaLedgerAccount(Base):
+    """授权额度账本账户：每个授权一行，记录期初余额与流水序号计数器。
+
+    - 账本功能启用时**已存在**的授权：以启用时刻的
+      ``(used_count, reserved_count, max_count)`` 为**期初余额**
+      （启动迁移幂等开立，启用前的历史变化不追溯）；
+    - 启用后**新建**的授权：以创建时的计数 ``(0, 0, max_count)`` 为期初，
+      与授权登记同事务开立；
+    - ``entry_count`` 为该授权已记账流水数（即最新流水序号 ``seq``），
+      记账时在业务事务内 +1（同通道写事务经咨询锁串行，序号单调无竞争）。
+    """
+
+    __tablename__ = "quota_ledger_accounts"
+
+    authorization_id: Mapped[int] = mapped_column(
+        ForeignKey("authorizations.id", ondelete="RESTRICT"), primary_key=True
+    )
+    opening_max_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    opening_used_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    opening_reserved_count: Mapped[int] = mapped_column(
+        Integer, nullable=False
+    )
+    opened_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    entry_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+
+
+class QuotaLedgerEntry(Base):
+    """授权三项计数（已用 / 预留 / 总额度）变化的逐笔流水（**只增不改**）。
+
+    直接发行与候补成交、预留及其确认/取消/到期、申请撤销/改期、
+    授权改挂与额度转拨造成的计数变化，按发生顺序逐笔记录：
+    每个授权内 ``seq`` 自 1 起单调递增（账户行计数器在业务事务内分配）；
+    每笔记录变化前后三项计数、关联业务编号（``biz_id``/``biz_ref``）
+    与发生时刻。流水与原始业务**同一事务**提交或回滚——业务拒绝、
+    回滚、幂等重放均不产生流水。应用层只 INSERT，不提供任何改写途径。
+    """
+
+    __tablename__ = "quota_ledger_entries"
+    __table_args__ = (
+        # 记账后仍须满足额度不变量，作为账本正确性的数据库护栏。
+        CheckConstraint(
+            "used_after >= 0 AND reserved_after >= 0 "
+            "AND used_after + reserved_after <= max_after",
+            name="ck_ledger_after_invariant",
+        ),
+        Index("ux_ledger_auth_seq", "authorization_id", "seq", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    authorization_id: Mapped[int] = mapped_column(
+        ForeignKey("authorizations.id", ondelete="RESTRICT"), nullable=False
+    )
+    # 授权内流水序号：自 1 起单调递增，翻页游标与固定上界均基于它。
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 变化来源：distribution_commit / distribution_revoke /
+    # distribution_reschedule_out / distribution_reschedule_in /
+    # waitlist_fulfill / reservation_create / reservation_confirm /
+    # reservation_cancel / reservation_expire /
+    # migration_out / migration_in / transfer_out / transfer_in。
+    entry_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 关联业务编号：申请/预留/候补主键；改挂与转拨为对端授权编号。
+    biz_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # 补充业务标识：候补成交生成的申请编号、转拨操作号、改挂方向等。
+    biz_ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    used_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    used_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    reserved_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    reserved_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_before: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_after: Mapped[int] = mapped_column(Integer, nullable=False)
+    # 业务发生时刻（与对应业务行的时刻字段同源，如 revoked_at）。
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, nullable=False
+    )
+
+
 class QuotaTransfer(Base):
     """一次授权间额度转拨：同一素材/地区/渠道下，把源授权未占用的
     可发行次数（``max_count`` 的一部分）转拨到目标授权。
